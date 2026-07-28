@@ -83,33 +83,56 @@ def get_database_context(engine, question: str) -> str:
             courses_all = conn.execute(text("SELECT id, title FROM courses LIMIT 100")).fetchall()
             batches_all = conn.execute(text("SELECT id, batch_code FROM batches LIMIT 100")).fetchall()
             
+            # Fetch global database metadata counts
+            total_trainers = conn.execute(text("SELECT COUNT(*) FROM trainers")).fetchone()[0]
+            total_courses = conn.execute(text("SELECT COUNT(*) FROM courses")).fetchone()[0]
+            total_batches = conn.execute(text("SELECT COUNT(*) FROM batches")).fetchone()[0]
+            total_feedbacks = conn.execute(text("SELECT COUNT(*) FROM feedback_records")).fetchone()[0]
+            
         # 2. Check for trainer names or departments in the question
         matched_trainers = []
+        titles = {"dr", "dr.", "prof", "prof.", "mr", "mr.", "ms", "ms.", "mrs", "mrs."}
         for t in trainers_all:
+            # Check for exact full name match first
             if t[1].lower() in question.lower():
                 matched_trainers.append(t[0])
+                continue
+            # Fallback to token-based matching (e.g. matching "Arjun" to "Dr. Arjun")
+            name_parts = [part.lower() for part in t[1].split() if part.lower() not in titles]
+            if any(part in question.lower() for part in name_parts if len(part) > 2):
+                matched_trainers.append(t[0])
                 
-        # Scan for common department keywords
+        # Scan for common department keywords using word boundaries for short abbreviations
         departments = ["CS", "Computer Science", "IT", "Information Technology", "Cloud", "Data Science", "DS", "MERN", "Full Stack", "UIUX", "UX"]
         matched_depts = []
         for d in departments:
-            if d.lower() in question.lower():
-                matched_depts.append(d)
+            if len(d) <= 4:
+                # Require word boundaries for abbreviations to avoid matching inside words like "criticize"
+                if re.search(rf"\b{re.escape(d.lower())}\b", question.lower()):
+                    matched_depts.append(d)
+            else:
+                if d.lower() in question.lower():
+                    matched_depts.append(d)
+
                 
         # 3. Build dynamic SQL query
-        where_clauses = []
+        where_clauses_recent = []
         cutoff_date = (datetime.date.today() - datetime.timedelta(days=90)).strftime('%Y-%m-%d')
-        where_clauses.append(f"f.created_at >= '{cutoff_date}'")
+        where_clauses_recent.append(f"f.created_at >= '{cutoff_date}'")
+        
+        where_clauses_all = []
         
         if matched_trainers:
             trainer_ids_str = ",".join([str(tid) for tid in matched_trainers])
-            where_clauses.append(f"f.trainer_id IN ({trainer_ids_str})")
+            where_clauses_recent.append(f"f.trainer_id IN ({trainer_ids_str})")
+            where_clauses_all.append(f"f.trainer_id IN ({trainer_ids_str})")
             
         if matched_depts:
             dept_filters = " OR ".join([f"f.department LIKE '%{d}%'" for d in matched_depts])
-            where_clauses.append(f"({dept_filters})")
+            where_clauses_recent.append(f"({dept_filters})")
+            where_clauses_all.append(f"({dept_filters})")
             
-        where_str = " AND ".join(where_clauses)
+        where_str = " AND ".join(where_clauses_recent)
         
         # If no specific entities matched, limit to 30 most recent feedbacks to keep prompt fast.
         # If specific entities matched, fetch up to 150 rows of data.
@@ -128,6 +151,22 @@ def get_database_context(engine, question: str) -> str:
         with engine.connect() as conn:
             feedback_all = conn.execute(text(query)).fetchall()
             
+        # Fallback to all-time feedback records if no recent records are found
+        if not feedback_all:
+            where_str_all = " AND ".join(where_clauses_all) if where_clauses_all else "1=1"
+            query_all = (
+                "SELECT f.created_at, f.student_name, f.feedback_text, f.rating, f.department, "
+                "       t.name AS trainer_name, u.filename AS source_file "
+                "FROM feedback_records f "
+                "LEFT JOIN trainers t ON f.trainer_id = t.id "
+                "LEFT JOIN upload_sessions u ON f.upload_session_id = u.id "
+                f"WHERE {where_str_all} "
+                f"ORDER BY f.created_at DESC LIMIT {limit_val}"
+            )
+            with engine.connect() as conn:
+                feedback_all = conn.execute(text(query_all)).fetchall()
+
+            
         # Format lists into structured context strings
         trainers_str = "\n".join([f"- ID: {t[0]} | Name: {t[1]}" for t in trainers_all])
         courses_str = "\n".join([f"- ID: {c[0]} | Title: {c[1]}" for c in courses_all])
@@ -144,6 +183,12 @@ def get_database_context(engine, question: str) -> str:
         
         # Combine into unified prompt representation
         context = (
+            f"=== SYSTEM DATABASE METADATA ===\n"
+            f"Total Trainers in Database: {total_trainers}\n"
+            f"Total Courses in Database: {total_courses}\n"
+            f"Total Batches in Database: {total_batches}\n"
+            f"Total Student Feedback Records in Database: {total_feedbacks}\n"
+            f"================================\n\n"
             f"=== SYSTEM DATABASE SNAPSHOT (LAST 90 DAYS) ===\n\n"
             f"TRAINERS IN SYSTEM:\n{trainers_str if trainers_str else 'None'}\n\n"
             f"COURSES IN SYSTEM:\n{courses_str if courses_str else 'None'}\n\n"
@@ -153,6 +198,7 @@ def get_database_context(engine, question: str) -> str:
             f"==============================================="
         )
         return context
+
         
     except Exception as e:
         print("Error loading database context:", str(e))
@@ -223,7 +269,6 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
-    sql_query: str = None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -276,7 +321,6 @@ def chat_endpoint(req: ChatRequest):
         # Load database snapshot into memory dynamically filtered
         db_context = get_database_context(engine, processed_query)
 
-
         # ══════════════════════════════════════════════════════
         # STEP 2: CONSTRUCT CHAT PROMPT WITH RAW DATA CONTEXT
         # ══════════════════════════════════════════════════════
@@ -315,6 +359,7 @@ def chat_endpoint(req: ChatRequest):
         set_cached_response(cache_key, res_obj)
         return res_obj
 
+
     except Exception as e:
         print("SQL RAG Execution Error:", str(e))
         raise HTTPException(status_code=500, detail=f"Database Chatbot Error: {str(e)}")
@@ -324,3 +369,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("RAG_PORT", 8000))
     uvicorn.run("fastapi_rag:app", host="0.0.0.0", port=port, reload=True)
+
