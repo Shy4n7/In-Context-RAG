@@ -38,9 +38,12 @@ When an administrator uploads a feedback Excel (`.xlsx` or `.csv`) file in the f
 ### 2. The Retrieval & Context Pipeline (How Data Gets to the AI)
 Rather than translating user prompts into SQL commands (which takes 2 LLM rounds and can cause syntax or join errors), this server uses an **In-Context RAG** pipeline:
 1. **Entity Scanner (Python):** When a user asks a question, Python quickly scans the question text against the list of active trainers, courses, and departments.
-2. **Dynamic Database Fetch:** 
-   - If keywords match a trainer or department (e.g. "Dr. Kumar"), Python queries MySQL *only* for feedback records associated with that trainer/department (up to 150 rows).
-   - If no keywords match (e.g. general questions), the database fetches the 30 most recent feedback records as a context snapshot.
+   - **TTL Reference Cache:** To prevent database overload, reference lists (trainers, courses, batches) and aggregate counts are cached in-memory with a **30-second TTL**. New entities added to the database are resolved dynamically within 30 seconds without requiring a server restart.
+   - **Disambiguation:** If a token match is ambiguous and maps to multiple trainers (e.g. searching for `"Arjun"` when `"Dr. Arjun"` and `"Arjun D"` both exist), a `[SYSTEM ALERT]` is dynamically injected into the context prompt to instruct the LLM to ask for user clarification or compare the feedback for both while calling out the ambiguity.
+2. **Dynamic Database Fetch & Paths:**
+   - **Metadata-Only Path:** If a query is classified as a general system metadata request (e.g. asking for database counts, active trainers list, course lists, or greetings) and contains no specific trainer or department criteria, feedback row fetching is skipped entirely. Only reference metadata is injected, saving prompt token usage and database load.
+   - **Targeted Entity Fetch:** If keywords match specific trainers or departments, Python queries MySQL *only* for feedback records associated with those entities (up to 150 rows).
+   - **Fallback General Fetch:** If no specific keywords match and the query is not metadata-only (e.g. general feedback questions), it fetches a dynamic context slice of the 30 most recent feedback records.
 3. **Prompt Augmentation:** Python structures the returned database rows, trainer list, course list, and batch codes into Markdown tables and injects them directly into the AI's prompt.
 4. **Single-Round Generation:** Gemini reads the entire prompt context window and writes the final answer in a single round.
 
@@ -79,9 +82,9 @@ The backend features multiple speed optimizations (local greetings, response cac
 
 | Query Scenario | Average Time | Execution Path | Performance vs. Old System |
 |---|---|---|---|
-| **Greetings / Hello** | **<1ms (0.001s)** | Welcome regex path (No DB, No LLM) | **>5000x Faster (was ~6s)** |
-| **Repeat Queries** | **~3ms (0.003s)** | In-memory Response Cache (No DB, No LLM) | **>2000x Faster (was ~6s)** |
-| **New Database Queries** | **~2.7s** | Dynamic Entity Retrieve + Single LLM round | **~3x Faster (was ~8.5s)** |
+| **Greetings / Hello** | **<1ms (0.001s)** | Welcome regex path (No DB, No LLM) | **>8000x Faster (was ~8.7s)** |
+| **Repeat Queries** | **~3ms (0.003s)** | In-memory Response Cache (No DB, No LLM) | **>2900x Faster (was ~8.7s)** |
+| **New Database Queries** | **~2.7s** | Dynamic Entity Retrieve + Single LLM round | **~3x Faster (was ~8.7s)** |
 | **Quota Recovery Queries** | **~7.5s - 11s** | Model Fallback Retries (Automatic Recovery) | **Robust (no crash/error)** |
 
 ---
@@ -94,10 +97,15 @@ The backend features multiple speed optimizations (local greetings, response cac
    ```
 
 2. **Configure Environment:**
-   Copy `.env.example` to `.env` and fill in your API key and database credentials:
-   ```bash
-   cp .env.example .env
-   ```
+   Create a `.env` file in the root directory (you can copy `.env.example` as a template) and explicitly define the following configuration variables:
+   - `GEMINI_API_KEY`: Your Google Gemini API Key.
+   - `DATABASE_URL`: Connection string for MySQL. Format: `mysql+pymysql://<DB_USER>:<DB_PASSWORD>@<DB_HOST>:<DB_PORT>/<DB_NAME>`
+     - `<DB_USER>`: Database user account username.
+     - `<DB_PASSWORD>`: Database user account password.
+     - `<DB_HOST>`: Database host server address (e.g. `localhost` or remote endpoint).
+     - `<DB_PORT>`: Database port (default `3306`).
+     - `<DB_NAME>`: The database schema name (e.g. `profice_feedback`).
+   - `RAG_PORT`: The API port to run the server on (default `8000`).
 
 3. **Run the Server:**
    ```bash

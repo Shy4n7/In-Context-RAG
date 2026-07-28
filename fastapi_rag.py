@@ -75,32 +75,102 @@ def set_cached_response(cache_key: str, data, ttl_seconds: int = 180):
         _response_cache[cache_key] = (data, time.time() + ttl_seconds)
 
 
+# ─────────────────────────────────────────────────────────────
+# REFERENCE DATA CACHE WITH TTL (30 seconds)
+# ─────────────────────────────────────────────────────────────
+_reference_cache = {
+    "data": None,
+    "expiry": 0
+}
+_ref_cache_lock = threading.Lock()
+
+def get_reference_data(engine, ttl_seconds: int = 30):
+    global _reference_cache
+    with _ref_cache_lock:
+        now = time.time()
+        if _reference_cache["data"] is not None and now < _reference_cache["expiry"]:
+            return _reference_cache["data"]
+        
+        try:
+            with engine.connect() as conn:
+                trainers_all = conn.execute(text("SELECT id, name FROM trainers LIMIT 100")).fetchall()
+                courses_all = conn.execute(text("SELECT id, title FROM courses LIMIT 100")).fetchall()
+                batches_all = conn.execute(text("SELECT id, batch_code FROM batches LIMIT 100")).fetchall()
+                
+                total_trainers = conn.execute(text("SELECT COUNT(*) FROM trainers")).fetchone()[0]
+                total_courses = conn.execute(text("SELECT COUNT(*) FROM courses")).fetchone()[0]
+                total_batches = conn.execute(text("SELECT COUNT(*) FROM batches")).fetchone()[0]
+                total_feedbacks = conn.execute(text("SELECT COUNT(*) FROM feedback_records")).fetchone()[0]
+            
+            data = {
+                "trainers_all": [(t[0], t[1]) for t in trainers_all],
+                "courses_all": [(c[0], c[1]) for c in courses_all],
+                "batches_all": [(b[0], b[1]) for b in batches_all],
+                "total_trainers": total_trainers,
+                "total_courses": total_courses,
+                "total_batches": total_batches,
+                "total_feedbacks": total_feedbacks
+            }
+            _reference_cache = {
+                "data": data,
+                "expiry": now + ttl_seconds
+            }
+            return data
+        except Exception as e:
+            if _reference_cache["data"] is not None:
+                print("Failed to fetch fresh reference data, using cached stale fallback:", str(e))
+                return _reference_cache["data"]
+            raise e
+
+
 def get_database_context(engine, question: str) -> str:
     try:
-        with engine.connect() as conn:
-            # 1. Fetch reference lists
-            trainers_all = conn.execute(text("SELECT id, name FROM trainers LIMIT 100")).fetchall()
-            courses_all = conn.execute(text("SELECT id, title FROM courses LIMIT 100")).fetchall()
-            batches_all = conn.execute(text("SELECT id, batch_code FROM batches LIMIT 100")).fetchall()
-            
-            # Fetch global database metadata counts
-            total_trainers = conn.execute(text("SELECT COUNT(*) FROM trainers")).fetchone()[0]
-            total_courses = conn.execute(text("SELECT COUNT(*) FROM courses")).fetchone()[0]
-            total_batches = conn.execute(text("SELECT COUNT(*) FROM batches")).fetchone()[0]
-            total_feedbacks = conn.execute(text("SELECT COUNT(*) FROM feedback_records")).fetchone()[0]
+        # 1. Fetch reference lists (cached with 30s TTL)
+        ref_data = get_reference_data(engine)
+        trainers_all = ref_data["trainers_all"]
+        courses_all = ref_data["courses_all"]
+        batches_all = ref_data["batches_all"]
+        
+        total_trainers = ref_data["total_trainers"]
+        total_courses = ref_data["total_courses"]
+        total_batches = ref_data["total_batches"]
+        total_feedbacks = ref_data["total_feedbacks"]
             
         # 2. Check for trainer names or departments in the question
-        matched_trainers = []
+        exact_trainers = []
+        token_trainers = []
         titles = {"dr", "dr.", "prof", "prof.", "mr", "mr.", "ms", "ms.", "mrs", "mrs."}
+        
         for t in trainers_all:
-            # Check for exact full name match first
-            if t[1].lower() in question.lower():
-                matched_trainers.append(t[0])
+            trainer_id, name = t[0], t[1]
+            # Exact full name check with word boundaries
+            if re.search(rf"\b{re.escape(name.lower())}\b", question.lower()):
+                exact_trainers.append((trainer_id, name))
                 continue
-            # Fallback to token-based matching (e.g. matching "Arjun" to "Dr. Arjun")
-            name_parts = [part.lower() for part in t[1].split() if part.lower() not in titles]
-            if any(part in question.lower() for part in name_parts if len(part) > 2):
-                matched_trainers.append(t[0])
+            # Token boundary fallback
+            name_parts = [part.lower() for part in name.split() if part.lower() not in titles]
+            matched_tokens = [part for part in name_parts if len(part) > 2 and re.search(rf"\b{re.escape(part)}\b", question.lower())]
+            if matched_tokens:
+                token_trainers.append((trainer_id, name))
+                
+        # Prioritize exact matches over token matches to reduce false multi-matches
+        matched_trainers_info = []
+        if exact_trainers:
+            matched_trainers_info = list(set(exact_trainers))
+        else:
+            matched_trainers_info = list(set(token_trainers))
+            
+        matched_trainers = [t[0] for t in matched_trainers_info]
+        
+        # Build disambiguation note if multiple trainers match the query
+        disambiguation_note = ""
+        if len(matched_trainers_info) > 1:
+            matched_names = ", ".join([f"'{t[1]}' (ID: {t[0]})" for t in matched_trainers_info])
+            disambiguation_note = (
+                f"\n[SYSTEM ALERT: The query matched multiple trainers: {matched_names}. "
+                f"Please ask the user to clarify which trainer they meant, or compare/summarize the feedback for both "
+                f"while explicitly calling out the ambiguity to the user.]\n"
+            )
                 
         # Scan for common department keywords using word boundaries for short abbreviations
         departments = ["CS", "Computer Science", "IT", "Information Technology", "Cloud", "Data Science", "DS", "MERN", "Full Stack", "UIUX", "UX"]
@@ -114,72 +184,92 @@ def get_database_context(engine, question: str) -> str:
                 if d.lower() in question.lower():
                     matched_depts.append(d)
 
+        # Detect if this is a general/metadata-only query (greeting, aggregate count request, entity lists)
+        # without any specific trainer or department filters
+        is_greeting = bool(_GREETING_PATTERN.search(question))
+        general_meta_patterns = [
+            r'\bhow many (trainers?|courses?|batches?|feedbacks?|records?|ratings?)\b',
+            r'\btotal (number of|count of)?\s*(trainers?|courses?|batches?|feedbacks?|records?)\b',
+            r'\blist (all )?(trainers?|courses?|batches?|departments?)\b',
+            r'\bwhat are the (available|active)?\s*(courses?|trainers?|batches?|departments?)\b',
+            r'\bwho are the trainers?\b',
+            r'\bshow (all )?(trainers?|courses?|batches?)\b',
+            r'\bdatabase summary\b',
+            r'\bgeneral overview\b',
+            r'\bhelp\b'
+        ]
+        is_general_meta = any(re.search(pat, question.lower()) for pat in general_meta_patterns)
+        
+        metadata_only = (is_greeting or is_general_meta) and not (matched_trainers or matched_depts)
+        
+        feedback_str = ""
+        if metadata_only:
+            feedback_str = "No student feedback records were loaded because this is a general metadata/system request."
+        else:
+            # 3. Build dynamic SQL query
+            where_clauses_recent = []
+            cutoff_date = (datetime.date.today() - datetime.timedelta(days=90)).strftime('%Y-%m-%d')
+            where_clauses_recent.append(f"f.created_at >= '{cutoff_date}'")
+            
+            where_clauses_all = []
+            
+            if matched_trainers:
+                trainer_ids_str = ",".join([str(tid) for tid in matched_trainers])
+                where_clauses_recent.append(f"f.trainer_id IN ({trainer_ids_str})")
+                where_clauses_all.append(f"f.trainer_id IN ({trainer_ids_str})")
                 
-        # 3. Build dynamic SQL query
-        where_clauses_recent = []
-        cutoff_date = (datetime.date.today() - datetime.timedelta(days=90)).strftime('%Y-%m-%d')
-        where_clauses_recent.append(f"f.created_at >= '{cutoff_date}'")
-        
-        where_clauses_all = []
-        
-        if matched_trainers:
-            trainer_ids_str = ",".join([str(tid) for tid in matched_trainers])
-            where_clauses_recent.append(f"f.trainer_id IN ({trainer_ids_str})")
-            where_clauses_all.append(f"f.trainer_id IN ({trainer_ids_str})")
+            if matched_depts:
+                dept_filters = " OR ".join([f"f.department LIKE '%{d}%'" for d in matched_depts])
+                where_clauses_recent.append(f"({dept_filters})")
+                where_clauses_all.append(f"({dept_filters})")
+                
+            where_str = " AND ".join(where_clauses_recent)
             
-        if matched_depts:
-            dept_filters = " OR ".join([f"f.department LIKE '%{d}%'" for d in matched_depts])
-            where_clauses_recent.append(f"({dept_filters})")
-            where_clauses_all.append(f"({dept_filters})")
+            # If no specific entities matched, limit to 30 most recent feedbacks to keep prompt fast.
+            # If specific entities matched, fetch up to 150 rows of data.
+            limit_val = 150 if (matched_trainers or matched_depts) else 30
             
-        where_str = " AND ".join(where_clauses_recent)
-        
-        # If no specific entities matched, limit to 30 most recent feedbacks to keep prompt fast.
-        # If specific entities matched, fetch up to 150 rows of data.
-        limit_val = 150 if (matched_trainers or matched_depts) else 30
-        
-        query = (
-            "SELECT f.created_at, f.student_name, f.feedback_text, f.rating, f.department, "
-            "       t.name AS trainer_name, u.filename AS source_file "
-            "FROM feedback_records f "
-            "LEFT JOIN trainers t ON f.trainer_id = t.id "
-            "LEFT JOIN upload_sessions u ON f.upload_session_id = u.id "
-            f"WHERE {where_str} "
-            f"ORDER BY f.created_at DESC LIMIT {limit_val}"
-        )
-        
-        with engine.connect() as conn:
-            feedback_all = conn.execute(text(query)).fetchall()
-            
-        # Fallback to all-time feedback records if no recent records are found
-        if not feedback_all:
-            where_str_all = " AND ".join(where_clauses_all) if where_clauses_all else "1=1"
-            query_all = (
+            query = (
                 "SELECT f.created_at, f.student_name, f.feedback_text, f.rating, f.department, "
                 "       t.name AS trainer_name, u.filename AS source_file "
                 "FROM feedback_records f "
                 "LEFT JOIN trainers t ON f.trainer_id = t.id "
                 "LEFT JOIN upload_sessions u ON f.upload_session_id = u.id "
-                f"WHERE {where_str_all} "
+                f"WHERE {where_str} "
                 f"ORDER BY f.created_at DESC LIMIT {limit_val}"
             )
+            
             with engine.connect() as conn:
-                feedback_all = conn.execute(text(query_all)).fetchall()
-
+                feedback_all = conn.execute(text(query)).fetchall()
+                
+            # Fallback to all-time feedback records if no recent records are found
+            if not feedback_all:
+                where_str_all = " AND ".join(where_clauses_all) if where_clauses_all else "1=1"
+                query_all = (
+                    "SELECT f.created_at, f.student_name, f.feedback_text, f.rating, f.department, "
+                    "       t.name AS trainer_name, u.filename AS source_file "
+                    "FROM feedback_records f "
+                    "LEFT JOIN trainers t ON f.trainer_id = t.id "
+                    "LEFT JOIN upload_sessions u ON f.upload_session_id = u.id "
+                    f"WHERE {where_str_all} "
+                    f"ORDER BY f.created_at DESC LIMIT {limit_val}"
+                )
+                with engine.connect() as conn:
+                    feedback_all = conn.execute(text(query_all)).fetchall()
+                
+            feedback_list = []
+            for f in feedback_all:
+                created_at = f[0].strftime('%Y-%m-%d') if isinstance(f[0], (datetime.datetime, datetime.date)) else str(f[0])
+                feedback_list.append(
+                    f"Date: {created_at} | Trainer: {f[5]} | Dept: {f[4]} | Rating: {f[3]} | "
+                    f"Student: {f[1]} | File: {f[6]} | Comment: {f[2]}"
+                )
+            feedback_str = "\n".join(feedback_list)
             
         # Format lists into structured context strings
         trainers_str = "\n".join([f"- ID: {t[0]} | Name: {t[1]}" for t in trainers_all])
         courses_str = "\n".join([f"- ID: {c[0]} | Title: {c[1]}" for c in courses_all])
         batches_str = "\n".join([f"- ID: {b[0]} | Code: {b[1]}" for b in batches_all])
-        
-        feedback_list = []
-        for f in feedback_all:
-            created_at = f[0].strftime('%Y-%m-%d') if isinstance(f[0], (datetime.datetime, datetime.date)) else str(f[0])
-            feedback_list.append(
-                f"Date: {created_at} | Trainer: {f[5]} | Dept: {f[4]} | Rating: {f[3]} | "
-                f"Student: {f[1]} | File: {f[6]} | Comment: {f[2]}"
-            )
-        feedback_str = "\n".join(feedback_list)
         
         # Combine into unified prompt representation
         context = (
@@ -197,9 +287,10 @@ def get_database_context(engine, question: str) -> str:
             f"{feedback_str if feedback_str else 'No matching feedback records in this timeframe.'}\n"
             f"==============================================="
         )
+        if disambiguation_note:
+            context += f"\n{disambiguation_note}"
+            
         return context
-
-        
     except Exception as e:
         print("Error loading database context:", str(e))
         raise e
