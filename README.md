@@ -78,14 +78,17 @@ Free-tier Gemini API keys have strict rate limits and daily quotas. To solve thi
 
 ## Performance & Latency Breakdown
 
-The backend features multiple speed optimizations (local greetings, response cache, and dynamic database slicing context retrieval) to keep latency extremely low:
+The backend features multiple speed optimizations (local greetings, response cache, and dynamic database slicing context retrieval) coupled with a **600ms minimum psychological latency pacing** to satisfy the "Labor Illusion":
 
 | Query Scenario | Average Time | Execution Path | Performance vs. Old System |
 |---|---|---|---|
-| **Greetings / Hello** | **<1ms (0.001s)** | Welcome regex path (No DB, No LLM) | **>8000x Faster (was ~8.7s)** |
-| **Repeat Queries** | **~3ms (0.003s)** | In-memory Response Cache (No DB, No LLM) | **>2900x Faster (was ~8.7s)** |
+| **Greetings / Hello** | **~600ms** | Welcome regex path + 600ms Pacing Delay | **~14x Faster (was ~8.7s)** |
+| **Repeat Queries** | **~600ms** | In-memory Response Cache + 600ms Pacing Delay | **~14x Faster (was ~8.7s)** |
 | **New Database Queries** | **~2.7s** | Dynamic Entity Retrieve + Single LLM round | **~3x Faster (was ~8.7s)** |
 | **Quota Recovery Queries** | **~7.5s - 11s** | Model Fallback Retries (Automatic Recovery) | **Robust (no crash/error)** |
+
+### Psychological Latency Pacing (The Labor Illusion)
+To prevent instantaneous responses (like cache hits or greetings that execute in <1ms) from feeling robotic, fake, or "alien" to the user, the backend enforces a minimum target response time of **600ms**. If database query and LLM processing finish faster than 600ms, the server sleeps for the remaining time to simulate natural pacing.
 
 ---
 
