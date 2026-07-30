@@ -368,86 +368,98 @@ class ChatResponse(BaseModel):
 @app.post("/api/chat", response_model=ChatResponse)
 def chat_endpoint(req: ChatRequest):
     try:
+        start_time = time.time()
+        res_obj = None
+
         # ══════════════════════════════════════════════════════
         # STEP 0: INSTANT FAST-PATHS  (<1ms — zero DB, zero LLM)
         # ══════════════════════════════════════════════════════
 
         # 0a. Greeting fast-path
         if _GREETING_PATTERN.search(req.question.strip()):
-            return ChatResponse(
+            res_obj = ChatResponse(
                 answer="Hello! I am your AI Database Assistant. Ask me any question about "
                        "trainers, ratings, courses, feedback records, or departments, and I "
                        "will query the database for you."
             )
 
-        # 0b. Pronoun resolution (history scan only)
-        has_pronoun = bool(_PRONOUN_PATTERN.search(req.question))
-        last_mentioned_trainer = None
-        if has_pronoun and req.history:
-            for h_item in reversed(req.history):
-                text_val = h_item.get("content", "")
-                name_match = re.search(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z.]+)+)\b', text_val)
-                if name_match:
-                    last_mentioned_trainer = name_match.group(1)
-                    break
+        else:
+            # 0b. Pronoun resolution (history scan only)
+            has_pronoun = bool(_PRONOUN_PATTERN.search(req.question))
+            last_mentioned_trainer = None
+            if has_pronoun and req.history:
+                for h_item in reversed(req.history):
+                    text_val = h_item.get("content", "")
+                    name_match = re.search(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z.]+)+)\b', text_val)
+                    if name_match:
+                        last_mentioned_trainer = name_match.group(1)
+                        break
 
-        processed_query = req.question
-        if has_pronoun and last_mentioned_trainer and last_mentioned_trainer.lower() not in processed_query.lower():
-            processed_query = f"For trainer {last_mentioned_trainer}: " + processed_query
+            processed_query = req.question
+            if has_pronoun and last_mentioned_trainer and last_mentioned_trainer.lower() not in processed_query.lower():
+                processed_query = f"For trainer {last_mentioned_trainer}: " + processed_query
 
-        # 0c. Response cache fast-path (TTL 3 min)
-        cache_key = f"{req.role}_{req.trainer_id}_{processed_query.strip().lower()}"
-        cached_res = get_cached_response(cache_key)
-        if cached_res:
-            return cached_res
+            # 0c. Response cache fast-path (TTL 3 min)
+            cache_key = f"{req.role}_{req.trainer_id}_{processed_query.strip().lower()}"
+            cached_res = get_cached_response(cache_key)
+            if cached_res:
+                res_obj = cached_res
+            else:
+                # ══════════════════════════════════════════════════════
+                # STEP 1: LOAD DB CONTEXT AND API CONFIGURATION
+                # ══════════════════════════════════════════════════════
+                engine = get_engine()
+                api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+                if not api_key:
+                    raise HTTPException(status_code=500, detail="Gemini API Key is not set in environment.")
 
-        # ══════════════════════════════════════════════════════
-        # STEP 1: LOAD DB CONTEXT AND API CONFIGURATION
-        # ══════════════════════════════════════════════════════
-        engine = get_engine()
-        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=500, detail="Gemini API Key is not set in environment.")
+                # Load database snapshot into memory dynamically filtered
+                db_context = get_database_context(engine, processed_query)
 
-        # Load database snapshot into memory dynamically filtered
-        db_context = get_database_context(engine, processed_query)
+                # ══════════════════════════════════════════════════════
+                # STEP 2: CONSTRUCT CHAT PROMPT WITH RAW DATA CONTEXT
+                # ══════════════════════════════════════════════════════
+                history_str = ""
+                if req.history:
+                    for item in req.history:
+                        role_name = "User" if item.get("role") == "user" else "Assistant"
+                        history_str += f"{role_name}: {item.get('content')}\n"
 
-        # ══════════════════════════════════════════════════════
-        # STEP 2: CONSTRUCT CHAT PROMPT WITH RAW DATA CONTEXT
-        # ══════════════════════════════════════════════════════
-        history_str = ""
-        if req.history:
-            for item in req.history:
-                role_name = "User" if item.get("role") == "user" else "Assistant"
-                history_str += f"{role_name}: {item.get('content')}\n"
+                system_instructions = (
+                    "You are the SQL Database Assistant for the Profice Feedback Portal.\n"
+                    "You have direct access to a snapshot of the database content below (including feedback, trainers, courses).\n\n"
+                    "Guidelines:\n"
+                    "- Answer the user's question directly, clearly, and concisely in 1-2 simple English sentences.\n"
+                    "- Use the database snapshot context to verify trainer performance, ratings, departments, batch codes, or file names.\n"
+                    "- Format all average values to strictly 1 digit after the decimal point (e.g. 4.3 or 3.8).\n"
+                    "- Do not invent facts or mention database structures, internal IDs, query syntax, or columns.\n"
+                    "- Keep your response conversational and factually precise according to the snapshot data."
+                )
 
-        system_instructions = (
-            "You are the SQL Database Assistant for the Profice Feedback Portal.\n"
-            "You have direct access to a snapshot of the database content below (including feedback, trainers, courses).\n\n"
-            "Guidelines:\n"
-            "- Answer the user's question directly, clearly, and concisely in 1-2 simple English sentences.\n"
-            "- Use the database snapshot context to verify trainer performance, ratings, departments, batch codes, or file names.\n"
-            "- Format all average values to strictly 1 digit after the decimal point (e.g. 4.3 or 3.8).\n"
-            "- Do not invent facts or mention database structures, internal IDs, query syntax, or columns.\n"
-            "- Keep your response conversational and factually precise according to the snapshot data."
-        )
+                full_prompt = (
+                    f"{system_instructions}\n\n"
+                    f"{db_context}\n\n"
+                    f"Conversation History:\n"
+                    f"{history_str if history_str else 'None'}\n\n"
+                    f"User Question: {processed_query}\n"
+                    f"Assistant:"
+                )
 
-        full_prompt = (
-            f"{system_instructions}\n\n"
-            f"{db_context}\n\n"
-            f"Conversation History:\n"
-            f"{history_str if history_str else 'None'}\n\n"
-            f"User Question: {processed_query}\n"
-            f"Assistant:"
-        )
+                # ══════════════════════════════════════════════════════
+                # STEP 3: EXECUTE SINGLE ROUND LLM COMPLETION
+                # ══════════════════════════════════════════════════════
+                response_text = safe_llm_complete_fallback(full_prompt, api_key)
+                
+                res_obj = ChatResponse(answer=response_text)
+                set_cached_response(cache_key, res_obj)
 
-        # ══════════════════════════════════════════════════════
-        # STEP 3: EXECUTE SINGLE ROUND LLM COMPLETION
-        # ══════════════════════════════════════════════════════
-        response_text = safe_llm_complete_fallback(full_prompt, api_key)
-        
-        res_obj = ChatResponse(answer=response_text)
-        set_cached_response(cache_key, res_obj)
+        # Enforce psychological "sweet spot" response time (approx 600ms)
+        # to prevent instantaneous responses (greetings, cache hits) from feeling robotic/fake.
+        elapsed = time.time() - start_time
+        target_delay = 0.6  # 600ms
+        if elapsed < target_delay:
+            time.sleep(target_delay - elapsed)
+
         return res_obj
 
 
