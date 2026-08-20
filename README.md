@@ -1,3 +1,7 @@
+<img width="1774" height="887" alt="ChatGPT Image Aug 20, 2026, 02_42_53 PM" src="https://github.com/user-attachments/assets/1d589ec6-5c18-49b8-af9d-39cc1d88503e" />
+
+
+
 # In-Context RAG Bot Backend
 
 A high-performance, single-round In-Context Retrieval-Augmented Generation (RAG) chatbot backend built using FastAPI and Google Gemini.
